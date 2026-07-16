@@ -121,7 +121,10 @@ export class ExactXrplScheme implements SchemeNetworkServer {
         throw new Error("XRPL exact payments require extra.sourceTag with facilitatorProof");
       }
     }
-
+    const crossCurrency = paymentRequirements.extra?.crossCurrency;
+    if (crossCurrency !== undefined && crossCurrency !== true) {
+      throw new Error("XRPL exact payments require extra.crossCurrency to be true when provided");
+    }
     const features = supportedKind.extra?.features;
     if (sourceTag !== undefined && (!isRecord(features) || features.sourceTag !== true)) {
       throw new Error("XRPL facilitator does not advertise SourceTag attribution support");
@@ -131,6 +134,9 @@ export class ExactXrplScheme implements SchemeNetworkServer {
       (!isRecord(features) || features.facilitatorProof !== true)
     ) {
       throw new Error("XRPL facilitator does not advertise facilitatorProof support");
+    }
+    if (crossCurrency === true && (!isRecord(features) || features.crossCurrency !== true)) {
+      throw new Error("XRPL facilitator does not advertise cross-currency support");
     }
 
     return Promise.resolve({

@@ -63,6 +63,7 @@ This page tracks which features are implemented in each SDK (TypeScript, Go, Pyt
 
 | Capability | TypeScript | Go | Python |
 |------------|------------|-----|--------|
+| Cross-currency exact payments | ✅ | ❌ | ❌ |
 | Facilitator attribution (`sourceTag`, `facilitatorProof`) | ✅ | ❌ | ❌ |
 
 ## Extensions

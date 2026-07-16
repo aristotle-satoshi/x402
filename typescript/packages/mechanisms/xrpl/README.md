@@ -28,7 +28,6 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 - `createTickets(signer, network, ticketCount)` - Creates XRPL Tickets for `ticketSequence` payments.
 - `getXrplTicketSequences(account, network)` - Lists an account's available ticket sequences.
 - `invoiceIdToInvoiceIdField(invoiceId)` - Converts an invoice id to an XRPL `InvoiceID`.
-- `buildFacilitatorAttributionMemos(sourceTag, facilitatorProof)` - Builds the canonical facilitator-attribution Memo.
 - XRPL network constants: `XRPL_MAINNET`, `XRPL_TESTNET`, `XRPL_DEVNET`.
 
 ### Subpath Exports
@@ -50,6 +49,35 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 - XRPL issued currencies (IOUs): `asset` is the currency code (3-character or 40-hex), `amount` is the exact XRPL issued-currency decimal `value` string (for example `"10.5"`), and `extra.issuer` is the issuer classic address.
 
 There is no `extra.decimals` field: XRPL issued-currency amounts are ledger decimal values, so the requirement `amount` is used verbatim as the signed `value`. XRPL exact payments use explicit `AssetAmount` pricing; dollar-string default asset mapping is not included for XRPL.
+
+## Cross-Currency Exact Payments
+
+Set `extra.crossCurrency: true` in the resource configuration to let the payer deliver the exact target amount from a different source asset. The signed transaction keeps `Amount`/`DeliverMax` equal to the required destination amount; `SendMax` is the payer's absolute source-asset cap, including transfer fees, exchange rates, and approved slippage.
+
+The server enables this only when the facilitator advertises `features.crossCurrency: true`. The client requires `preparePaymentTransaction` for cross-currency requirements so the application must perform current path/quote preflight and explicitly apply its approved `SendMax` and optional `Paths` before signing:
+
+```typescript
+import type { Payment } from "xrpl";
+import { ExactXrplScheme } from "@x402/xrpl/exact/client";
+
+const approvedSendMax: Payment["SendMax"] = "25000000";
+const approvedPaths: Payment["Paths"] = undefined;
+
+const xrplScheme = new ExactXrplScheme(signer, {
+  preparePaymentTransaction: async transaction =>
+    xrplClient.autofill({
+      ...transaction,
+      SendMax: approvedSendMax,
+      ...(approvedPaths ? { Paths: approvedPaths } : {}),
+    }),
+});
+```
+
+The callback must preserve the destination and exact target amount. Omitted `Paths` uses XRPL's default path; explicit paths must be non-empty. `tfNoRippleDirect` is valid only with explicit paths. The client and facilitator reject `tfPartialPayment`, `DeliverMin`, same-asset or non-positive source caps, and malformed path policy.
+
+The facilitator simulates the exact signed transaction during verification and settlement re-verification, including its `delivered_amount` metadata. Settlement succeeds only for validated `tesSUCCESS` metadata with the required destination asset and issue. XRP drops must match exactly; issued-currency values use XRPL's 15-significant-digit precision tolerance because ledger metadata can differ from `Amount` by one least-significant precision unit. Quote or simulation success is not a guarantee because ledger liquidity can change before validation.
+
+Issued-currency `SendMax.value` accepts XRPL decimal strings in plain or `e`/`E` scientific notation and is parsed without binary floating point.
 
 ## Asset Transfer Methods
 
@@ -74,33 +102,6 @@ const ticketSequences = await createTickets(signer, "xrpl:1", 5);
 ```
 
 Each outstanding ticket locks owner reserve (currently 0.2 XRP on mainnet) until it is used or deleted, and an account can hold at most 250 outstanding tickets.
-
-## Facilitator Attribution
-
-Resource servers can explicitly bind a payment to the facilitator expected to submit it:
-
-- `extra.sourceTag` is an XRPL `uint32` selected by the resource server and copied into the signed transaction's `SourceTag`.
-- `extra.facilitatorProof` is an optional 32-byte hex commitment. It requires `sourceTag` and is encoded with that tag in one canonical typed Memo.
-
-```typescript
-{
-  scheme: "exact",
-  price: { amount: "1000000", asset: "XRP" },
-  network: "xrpl:1",
-  payTo: "r...",
-  extra: {
-    sourceTag: 804681468,
-    facilitatorProof:
-      "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
-  },
-}
-```
-
-The server checks the facilitator's `/supported` metadata before advertising these fields. The official facilitator advertises `features.sourceTag` and `features.facilitatorProof`; it never supplies a fallback tag. If the fields are omitted, the default client omits both `SourceTag` and `Memos`. For backward compatibility, a custom transaction preparer may preserve its own payer-signed `SourceTag`, but that value has no facilitator-attribution meaning.
-
-These fields label the facilitator expected by the resource server; they do not prove which network peer broadcast the signed blob. Do not use them alone for rewards, security decisions, or submitter accountability.
-
-Invoice binding is independent and continues to use `extra.invoiceId` plus the signed `InvoiceID` field. The facilitator-attribution Memo is never accepted as invoice binding.
 
 ## Testnet Setup
 
@@ -132,7 +133,7 @@ The default client uses `xrpl.Client` to autofill ledger-derived fields before s
 - `LastLedgerSequence`
 - `NetworkID` for custom XRPL networks
 
-Use `wsUrlByNetwork` or `clientFactory` to customize the XRPL connection, and `feeDrops` only when the client should use an explicit fee instead of the network autofill value. If a wallet or application prepares transactions externally, pass `preparePaymentTransaction`; the returned transaction must satisfy the selected asset transfer method, and include `Fee`, `LastLedgerSequence`, and the correct custom-network `NetworkID` when applicable.
+Use `wsUrlByNetwork` or `clientFactory` to customize the XRPL connection, and `feeDrops` only when the client should use an explicit fee instead of the network autofill value. If a wallet or application prepares transactions externally, pass `preparePaymentTransaction`; the returned transaction must satisfy the selected asset transfer method, and include `Fee`, `LastLedgerSequence`, and the correct custom-network `NetworkID` when applicable. Cross-currency requirements always require this callback to apply a payer-approved source cap and path policy.
 
 For `"ticketSequence"` payments, `ticketCreateCount` controls automatic ticket creation when the
 account has no available tickets. It defaults to `1`; set it to `0` to require pre-provisioned
@@ -164,7 +165,7 @@ Use explicit asset pricing:
 }
 ```
 
-The server scheme adds `extra.areFeesSponsored: false` to the advertised requirements. Invoice binding is enforced when the resource configuration provides `extra.invoiceId`; facilitator attribution is enforced only when the resource configuration provides `extra.sourceTag` and optionally `extra.facilitatorProof`. Requirements are rebuilt for every request, so the scheme never injects per-request values.
+The server scheme adds `extra.areFeesSponsored: false` to the advertised requirements. Invoice binding is enforced when the resource configuration provides `extra.invoiceId`; cross-currency behavior is enabled only when it provides `extra.crossCurrency: true` and the facilitator advertises support. Requirements are rebuilt for every request, so the scheme never injects per-request values.
 
 ### Facilitator
 
@@ -175,7 +176,7 @@ import { ExactXrplScheme } from "@x402/xrpl/exact/facilitator";
 const facilitator = new x402Facilitator().register("xrpl:*", new ExactXrplScheme());
 ```
 
-Verification enforces the spec's checks: envelope consistency, offline signature validation, signer-to-account authorization (the embedded `SigningPubKey` must be the account's master key pair, unless disabled, or its configured regular key), destination and amount matching, NetworkID binding, per-method sequencing (current account `Sequence`, or ticket availability), `LastLedgerSequence` expiry policy, invoice binding via `InvoiceID`, negotiated `SourceTag` and canonical facilitator-attribution Memo validation, fee caps, safety rejections (`Delegate`, unnegotiated `Memos`, `Paths`, `DeliverMin`, partial payments, multisigned blobs), and an XRPL simulation. Settlement re-runs verification, submits the signed blob, and succeeds only on a validated `tesSUCCESS` result.
+Verification enforces the spec's checks: envelope consistency, offline signature validation, signer-to-account authorization (the embedded `SigningPubKey` must be the account's master key pair, unless disabled, or its configured regular key), destination and amount matching, NetworkID binding, per-method sequencing (current account `Sequence`, or ticket availability), `LastLedgerSequence` expiry policy, invoice binding via `InvoiceID`, fee caps, safety rejections (`Delegate`, `Memos`, unnegotiated `Paths`, `DeliverMin`, partial payments, multisigned blobs), and an XRPL simulation. For opt-in cross-currency payments it additionally validates the signed source cap, path policy, and simulated delivery metadata. Settlement re-runs verification, submits the signed blob, and succeeds only on validated `tesSUCCESS`; cross-currency settlement also requires XRPL-precision-equivalent `delivered_amount` metadata.
 
 ## Duplicate Settlement Protection
 

@@ -58,6 +58,11 @@ export type XrplPaymentRequirementsExtra = {
    */
   facilitatorProof?: string;
   /**
+   * Enables a payer-selected source asset and signed SendMax cap.
+   * The only valid present value is true.
+   */
+  crossCurrency?: true;
+  /**
    * Required IOU issuer address for issued-currency payments.
    */
   issuer?: string;
@@ -104,6 +109,8 @@ export type XrplClientOptions = {
   ticketCreateCount?: number;
   /**
    * Optional function to prepare/autofill the transaction before signing.
+   * Required for crossCurrency payments, where it must apply a payer-approved
+   * SendMax and optional Paths from current quote preflight.
    */
   preparePaymentTransaction?: (
     transaction: Payment,
@@ -135,6 +142,10 @@ export type XrplSettlementResult = {
    * XRPL transaction result code.
    */
   resultCode: string;
+  /**
+   * Amount actually delivered according to validated transaction metadata.
+   */
+  deliveredAmount?: Payment["Amount"] | "unavailable";
 };
 
 /**
@@ -149,6 +160,10 @@ export type XrplSimulationResult = {
    * Human-readable engine result message.
    */
   engineResultMessage?: string;
+  /**
+   * Amount the simulated transaction would deliver according to metadata.
+   */
+  deliveredAmount?: Payment["Amount"] | "unavailable";
 };
 
 /**

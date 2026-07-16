@@ -6,19 +6,21 @@ import { ExactXrplScheme as ExactXrplServerScheme } from "../../src/exact/server
 import { createXrplWalletSigner } from "../../src/signer";
 import {
   DEFAULT_MAX_FEE_DROPS,
-  FACILITATOR_ATTRIBUTION_MEMO_FORMAT,
-  FACILITATOR_ATTRIBUTION_MEMO_TYPE,
   SETTLEMENT_TTL_MS,
   SettlementCache,
+  TF_NO_RIPPLE_DIRECT,
+  TF_PARTIAL_PAYMENT,
   XRPL_TESTNET,
+  areXrplTokenAmountsEquivalent,
   compareDecimalStrings,
-  buildFacilitatorAttributionMemos,
   createTickets,
-  facilitatorAttributionMemoData,
   getXrplTicketSequences,
   invoiceIdToInvoiceIdField,
+  isDifferentXrplSourceAsset,
+  isNonEmptyXrplPathSet,
   resolveAssetTransferMethod,
   simulateSignedTransaction,
+  submitSignedTransaction,
 } from "../../src";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import type { Client, Payment, Transaction } from "xrpl";
@@ -28,8 +30,7 @@ const otherWallet = Wallet.fromSeed("sEd7t79mzn2dwy3vvpvRmaaLbLhvme6");
 const payTo = "rGsd42GGEq1tJBPQ3Aoj9iyePZbxiX5Nrv";
 const issuer = "rL4JcsJfvkYYAqNhjZ7Gvkh14eF7GXRh3q";
 const invoiceId = "INV-2026-XRPL-001";
-const sourceTag = 804_681_468;
-const facilitatorProof = "0123456789abcdef".repeat(4);
+const sourceIssuer = otherWallet.classicAddress;
 
 const baseXrpRequirements: PaymentRequirements = {
   scheme: "exact",
@@ -64,12 +65,19 @@ const ticketXrpRequirements: PaymentRequirements = {
   },
 };
 
-const attributionXrpRequirements: PaymentRequirements = {
+const crossCurrencyIouRequirements: PaymentRequirements = {
+  ...baseIouRequirements,
+  extra: {
+    ...baseIouRequirements.extra,
+    crossCurrency: true,
+  },
+};
+
+const crossCurrencyXrpRequirements: PaymentRequirements = {
   ...baseXrpRequirements,
   extra: {
     ...baseXrpRequirements.extra,
-    sourceTag,
-    facilitatorProof,
+    crossCurrency: true,
   },
 };
 
@@ -86,8 +94,6 @@ function buildPayload(
     typeof requirements.extra?.invoiceId === "string"
       ? { InvoiceID: invoiceIdToInvoiceIdField(requirements.extra.invoiceId) }
       : {};
-  const requiredSourceTag = requirements.extra?.sourceTag;
-  const requiredFacilitatorProof = requirements.extra?.facilitatorProof;
   const basePayment: Payment = {
     TransactionType: "Payment",
     Account: payerWallet.classicAddress,
@@ -105,12 +111,6 @@ function buildPayload(
     ...invoice,
     ...(typeof requirements.extra?.destinationTag === "number"
       ? { DestinationTag: requirements.extra.destinationTag }
-      : {}),
-    ...(typeof requiredSourceTag === "number" ? { SourceTag: requiredSourceTag } : {}),
-    ...(typeof requiredSourceTag === "number" && typeof requiredFacilitatorProof === "string"
-      ? {
-          Memos: buildFacilitatorAttributionMemos(requiredSourceTag, requiredFacilitatorProof),
-        }
       : {}),
     ...(!isXrp
       ? {
@@ -157,7 +157,13 @@ function createFacilitator(
       getAccountAuthorization: async () => ({ isMasterKeyDisabled: false }),
       isTicketAvailable: async () => true,
       maxFeeDrops: DEFAULT_MAX_FEE_DROPS,
-      simulateSignedTransaction: async () => ({ engineResult: "tesSUCCESS" }),
+      simulateSignedTransaction: async signedTxBlob => {
+        const transaction = decode(signedTxBlob) as Payment;
+        return {
+          engineResult: "tesSUCCESS",
+          deliveredAmount: transaction.DeliverMax ?? transaction.Amount,
+        };
+      },
       ...overrides,
     },
     settlementCache,
@@ -169,30 +175,54 @@ describe("XRPL exact utilities", () => {
     expect(invoiceIdToInvoiceIdField("INV-1")).toMatch(/^[A-F0-9]{64}$/);
   });
 
-  it("encodes canonical facilitator attribution memos", () => {
-    const expectedData = "2FF676FC0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
-
-    expect(facilitatorAttributionMemoData(sourceTag, facilitatorProof)).toBe(expectedData);
-    expect(buildFacilitatorAttributionMemos(sourceTag, facilitatorProof)).toEqual([
-      {
-        Memo: {
-          MemoType: FACILITATOR_ATTRIBUTION_MEMO_TYPE,
-          MemoFormat: FACILITATOR_ATTRIBUTION_MEMO_FORMAT,
-          MemoData: expectedData,
-        },
-      },
-    ]);
-  });
-
-  it("rejects malformed facilitator attribution memo inputs", () => {
-    expect(() => facilitatorAttributionMemoData(-1, facilitatorProof)).toThrow("sourceTag");
-    expect(() => facilitatorAttributionMemoData(sourceTag, "not-hex")).toThrow("facilitatorProof");
-  });
-
   it("compares issued-currency decimal values exactly", () => {
     expect(compareDecimalStrings("10.5", "10.50")).toBe(0);
     expect(compareDecimalStrings("10.5", "10.49")).toBe(1);
     expect(compareDecimalStrings("0.000001", "0.00001")).toBe(-1);
+    expect(compareDecimalStrings("1.23e11", "123000000000")).toBe(0);
+    expect(compareDecimalStrings("1E-5", "0.000009")).toBe(1);
+  });
+
+  it("compares delivered token amounts using XRPL precision", () => {
+    expect(areXrplTokenAmountsEquivalent("10.5", "10.50")).toBe(true);
+    expect(areXrplTokenAmountsEquivalent("10.49999999999999", "10.5")).toBe(true);
+    expect(areXrplTokenAmountsEquivalent("10.499999999", "10.5")).toBe(false);
+    expect(areXrplTokenAmountsEquivalent("1.23e11", "123000000000")).toBe(true);
+    expect(areXrplTokenAmountsEquivalent("1e1000", "10.5")).toBe(false);
+  });
+
+  it("recognizes positive cross-currency source caps", () => {
+    const destinationIou = { currency: "USD", issuer, value: "10.5" };
+
+    expect(isDifferentXrplSourceAsset("25000000", destinationIou)).toBe(true);
+    expect(
+      isDifferentXrplSourceAsset(
+        { currency: "EUR", issuer: sourceIssuer, value: "20" },
+        destinationIou,
+      ),
+    ).toBe(true);
+    expect(
+      isDifferentXrplSourceAsset({ currency: "USD", issuer, value: "20" }, destinationIou),
+    ).toBe(false);
+    expect(isDifferentXrplSourceAsset("0", destinationIou)).toBe(false);
+    expect(
+      isDifferentXrplSourceAsset(
+        { currency: "EUR", issuer: sourceIssuer, value: "1e-5" },
+        destinationIou,
+      ),
+    ).toBe(true);
+    expect(
+      isDifferentXrplSourceAsset(
+        { currency: "EUR", issuer: sourceIssuer, value: "1E96" },
+        destinationIou,
+      ),
+    ).toBe(false);
+  });
+
+  it("recognizes only non-empty explicit path sets", () => {
+    expect(isNonEmptyXrplPathSet([[{ account: issuer }]])).toBe(true);
+    expect(isNonEmptyXrplPathSet([])).toBe(false);
+    expect(isNonEmptyXrplPathSet([[]])).toBe(false);
   });
 
   it("defaults the asset transfer method to sequence", () => {
@@ -244,6 +274,12 @@ describe("XRPL exact utilities", () => {
       result: {
         engine_result: "tesSUCCESS",
         engine_result_message: "The transaction was applied.",
+        meta: {
+          TransactionIndex: 0,
+          TransactionResult: "tesSUCCESS",
+          AffectedNodes: [],
+          delivered_amount: "1000000",
+        },
       },
     }));
     const fakeClient = {
@@ -269,7 +305,36 @@ describe("XRPL exact utilities", () => {
     expect(result).toEqual({
       engineResult: "tesSUCCESS",
       engineResultMessage: "The transaction was applied.",
+      deliveredAmount: "1000000",
     });
+  });
+
+  it("extracts delivered_amount from validated submission metadata", async () => {
+    const deliveredAmount = { currency: "USD", issuer, value: "10.5" };
+    const fakeClient = {
+      connect: vi.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
+      submitAndWait: vi.fn(async () => ({
+        result: {
+          hash: "D".repeat(64),
+          validated: true,
+          meta: {
+            TransactionIndex: 0,
+            TransactionResult: "tesSUCCESS",
+            AffectedNodes: [],
+            delivered_amount: deliveredAmount,
+          },
+        },
+      })),
+    } as unknown as Client;
+
+    const result = await submitSignedTransaction(
+      String(buildPayload(baseXrpRequirements).payload.signedTxBlob),
+      XRPL_TESTNET,
+      { clientFactory: () => fakeClient },
+    );
+
+    expect(result.deliveredAmount).toEqual(deliveredAmount);
   });
 
   it("lists available ticket sequences across paginated ledger objects", async () => {
@@ -626,61 +691,53 @@ describe("ExactXrplScheme server", () => {
     ).toThrow("destinationTag");
   });
 
-  it("preserves negotiated facilitator attribution when supported", async () => {
+  it("preserves cross-currency opt-in when the facilitator supports it", async () => {
     const server = new ExactXrplServerScheme();
 
     const result = await server.enhancePaymentRequirements(
-      attributionXrpRequirements,
+      crossCurrencyIouRequirements,
       {
         x402Version: 2,
         scheme: "exact",
         network: XRPL_TESTNET,
-        extra: {
-          features: { sourceTag: true, facilitatorProof: true },
-        },
+        extra: { features: { crossCurrency: true } },
       },
       [],
     );
 
-    expect(result.extra).toMatchObject({ sourceTag, facilitatorProof });
+    expect(result.extra?.crossCurrency).toBe(true);
   });
 
-  it("rejects attribution when the facilitator does not advertise support", () => {
+  it("rejects cross-currency requirements with an incompatible facilitator", () => {
     const server = new ExactXrplServerScheme();
 
     expect(() =>
       server.enhancePaymentRequirements(
-        attributionXrpRequirements,
+        crossCurrencyIouRequirements,
         { x402Version: 2, scheme: "exact", network: XRPL_TESTNET },
         [],
       ),
-    ).toThrow("does not advertise SourceTag");
+    ).toThrow("does not advertise cross-currency");
   });
 
-  it.each<Array<[string, Record<string, unknown>, string]>>([
-    ["negative SourceTag", { sourceTag: -1 }, "sourceTag"],
-    ["oversized SourceTag", { sourceTag: 0x1_0000_0000 }, "sourceTag"],
-    ["fractional SourceTag", { sourceTag: 1.5 }, "sourceTag"],
-    ["malformed proof", { sourceTag, facilitatorProof: "not-hex" }, "facilitatorProof"],
-    ["proof without SourceTag", { facilitatorProof }, "extra.sourceTag"],
-  ])("rejects %s when enhancing requirements", (_caseName, attribution, expectedMessage) => {
+  it("rejects false cross-currency negotiation", () => {
     const server = new ExactXrplServerScheme();
 
     expect(() =>
       server.enhancePaymentRequirements(
         {
           ...baseXrpRequirements,
-          extra: { ...baseXrpRequirements.extra, ...attribution },
+          extra: { ...baseXrpRequirements.extra, crossCurrency: false },
         },
         {
           x402Version: 2,
           scheme: "exact",
           network: XRPL_TESTNET,
-          extra: { features: { sourceTag: true, facilitatorProof: true } },
+          extra: { features: { crossCurrency: true } },
         },
         [],
       ),
-    ).toThrow(expectedMessage);
+    ).toThrow("crossCurrency to be true");
   });
 });
 
@@ -705,103 +762,6 @@ describe("ExactXrplScheme client", () => {
     expect(decoded.Sequence).toBe(1);
     expect(decoded.Fee).toBe(DEFAULT_MAX_FEE_DROPS);
     expect(decoded.LastLedgerSequence).toBe(994);
-    expect(decoded.SourceTag).toBeUndefined();
-    expect(decoded.Memos).toBeUndefined();
-  });
-
-  it("creates a signed payment with negotiated facilitator attribution", async () => {
-    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
-      getCurrentLedgerIndex: async () => 980,
-      preparePaymentTransaction: preparePaymentForTest,
-    });
-
-    const result = await client.createPaymentPayload(2, attributionXrpRequirements);
-    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
-
-    expect(decoded.SourceTag).toBe(sourceTag);
-    expect(decoded.Memos).toEqual(buildFacilitatorAttributionMemos(sourceTag, facilitatorProof));
-    expect(decoded.InvoiceID).toBe(invoiceIdToInvoiceIdField(invoiceId));
-  });
-
-  it("creates a SourceTag-only attribution payment without Memos", async () => {
-    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
-      getCurrentLedgerIndex: async () => 980,
-      preparePaymentTransaction: preparePaymentForTest,
-    });
-    const requirements = {
-      ...baseXrpRequirements,
-      extra: { ...baseXrpRequirements.extra, sourceTag },
-    };
-
-    const result = await client.createPaymentPayload(2, requirements);
-    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
-
-    expect(decoded.SourceTag).toBe(sourceTag);
-    expect(decoded.Memos).toBeUndefined();
-  });
-
-  it.each<Array<[string, Record<string, unknown>, string]>>([
-    ["negative SourceTag", { sourceTag: -1 }, "sourceTag"],
-    ["oversized SourceTag", { sourceTag: 0x1_0000_0000 }, "sourceTag"],
-    ["malformed proof", { sourceTag, facilitatorProof: "not-hex" }, "facilitatorProof"],
-    ["proof without SourceTag", { facilitatorProof }, "extra.sourceTag"],
-  ])("rejects %s before signing", async (_caseName, attribution, expectedMessage) => {
-    const sign = vi.fn(createXrplWalletSigner(payerWallet).sign);
-    const client = new ExactXrplClientScheme(
-      { classicAddress: payerWallet.classicAddress, sign },
-      { preparePaymentTransaction: preparePaymentForTest },
-    );
-
-    await expect(
-      client.createPaymentPayload(2, {
-        ...baseXrpRequirements,
-        extra: { ...baseXrpRequirements.extra, ...attribution },
-      }),
-    ).rejects.toThrow(expectedMessage);
-    expect(sign).not.toHaveBeenCalled();
-  });
-
-  it("rejects a preparer that removes negotiated SourceTag attribution", async () => {
-    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
-      preparePaymentTransaction: async transaction => {
-        const prepared = await preparePaymentForTest(transaction);
-        const withoutSourceTag = { ...prepared };
-        delete withoutSourceTag.SourceTag;
-        return withoutSourceTag;
-      },
-    });
-
-    await expect(client.createPaymentPayload(2, attributionXrpRequirements)).rejects.toThrow(
-      "preserve the negotiated SourceTag",
-    );
-  });
-
-  it("preserves a payer-selected SourceTag when attribution is not negotiated", async () => {
-    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
-      preparePaymentTransaction: async transaction => ({
-        ...(await preparePaymentForTest(transaction)),
-        SourceTag: sourceTag,
-      }),
-    });
-
-    const result = await client.createPaymentPayload(2, baseXrpRequirements);
-    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
-
-    expect(decoded.SourceTag).toBe(sourceTag);
-    expect(baseXrpRequirements.extra?.sourceTag).toBeUndefined();
-  });
-
-  it("rejects a preparer that changes the attribution Memo", async () => {
-    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
-      preparePaymentTransaction: async transaction => ({
-        ...(await preparePaymentForTest(transaction)),
-        Memos: [{ Memo: { MemoData: "00".repeat(36) } }],
-      }),
-    });
-
-    await expect(client.createPaymentPayload(2, attributionXrpRequirements)).rejects.toThrow(
-      "preserve the facilitator attribution Memo",
-    );
   });
 
   it("creates a signed IOU payment payload with SendMax and destination tag", async () => {
@@ -827,6 +787,131 @@ describe("ExactXrplScheme client", () => {
     expect(decoded.Sequence).toBe(1);
     expect(decoded.Fee).toBe(DEFAULT_MAX_FEE_DROPS);
     expect(decoded.LastLedgerSequence).toBe(994);
+  });
+
+  it("creates a cross-currency IOU destination payment with an XRP source cap", async () => {
+    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
+      preparePaymentTransaction: async transaction => ({
+        ...(await preparePaymentForTest(transaction)),
+        SendMax: "25000000",
+      }),
+    });
+
+    const result = await client.createPaymentPayload(2, crossCurrencyIouRequirements);
+    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
+
+    expect(decoded.Amount).toEqual({ currency: "USD", issuer, value: "10.5" });
+    expect(decoded.SendMax).toBe("25000000");
+    expect(decoded.Paths).toBeUndefined();
+    expect(decoded.DeliverMin).toBeUndefined();
+  });
+
+  it("creates a cross-currency XRP destination payment with explicit paths", async () => {
+    const sourceAmount = { currency: "USD", issuer: sourceIssuer, value: "20" };
+    const paths: NonNullable<Payment["Paths"]> = [[{ account: issuer }]];
+    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
+      preparePaymentTransaction: async transaction => ({
+        ...(await preparePaymentForTest(transaction)),
+        SendMax: sourceAmount,
+        Paths: paths,
+        Flags: TF_NO_RIPPLE_DIRECT,
+      }),
+    });
+
+    const result = await client.createPaymentPayload(2, crossCurrencyXrpRequirements);
+    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
+
+    expect(decoded.Amount).toBe(baseXrpRequirements.amount);
+    expect(decoded.SendMax).toEqual(sourceAmount);
+    expect(decoded.Paths).toEqual(paths);
+    expect(Number(decoded.Flags) & TF_NO_RIPPLE_DIRECT).toBe(TF_NO_RIPPLE_DIRECT);
+  });
+
+  it("accepts a scientific-notation issued-currency source cap", async () => {
+    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
+      preparePaymentTransaction: async transaction => ({
+        ...(await preparePaymentForTest(transaction)),
+        SendMax: { currency: "EUR", issuer: sourceIssuer, value: "1e-5" },
+      }),
+    });
+
+    const result = await client.createPaymentPayload(2, crossCurrencyIouRequirements);
+    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
+
+    expect(decoded.SendMax).toEqual({ currency: "EUR", issuer: sourceIssuer, value: "0.00001" });
+  });
+
+  it("requires explicit quote preparation before signing cross-currency payments", async () => {
+    const sign = vi.fn(createXrplWalletSigner(payerWallet).sign);
+    const client = new ExactXrplClientScheme({
+      classicAddress: payerWallet.classicAddress,
+      sign,
+    });
+
+    await expect(client.createPaymentPayload(2, crossCurrencyIouRequirements)).rejects.toThrow(
+      "require preparePaymentTransaction",
+    );
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it("rejects false cross-currency negotiation before signing", async () => {
+    const sign = vi.fn(createXrplWalletSigner(payerWallet).sign);
+    const client = new ExactXrplClientScheme({
+      classicAddress: payerWallet.classicAddress,
+      sign,
+    });
+
+    await expect(
+      client.createPaymentPayload(2, {
+        ...baseXrpRequirements,
+        extra: { ...baseXrpRequirements.extra, crossCurrency: false },
+      }),
+    ).rejects.toThrow("crossCurrency to be true");
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it.each<Array<[string, (payment: Payment) => Payment, string]>>([
+    ["missing SendMax", payment => ({ ...payment, SendMax: undefined }), "positive SendMax"],
+    [
+      "same-issue SendMax",
+      payment => ({ ...payment, SendMax: { currency: "USD", issuer, value: "20" } }),
+      "different source asset",
+    ],
+    ["zero SendMax", payment => ({ ...payment, SendMax: "0" }), "positive SendMax"],
+    [
+      "DeliverMin",
+      payment => ({ ...payment, SendMax: "25000000", DeliverMin: "1" }),
+      "must not set DeliverMin",
+    ],
+    [
+      "partial payment",
+      payment => ({ ...payment, SendMax: "25000000", Flags: TF_PARTIAL_PAYMENT }),
+      "must not enable tfPartialPayment",
+    ],
+    [
+      "tfNoRippleDirect without Paths",
+      payment => ({ ...payment, SendMax: "25000000", Flags: TF_NO_RIPPLE_DIRECT }),
+      "requires explicit Paths",
+    ],
+    [
+      "empty Paths",
+      payment => ({ ...payment, SendMax: "25000000", Paths: [] }),
+      "at least one non-empty path",
+    ],
+    [
+      "changed destination amount",
+      payment => ({ ...payment, Amount: { currency: "USD", issuer, value: "9" }, SendMax: "25" }),
+      "preserve the exact IOU destination amount",
+    ],
+  ])("rejects a cross-currency preparer with %s", async (_name, mutate, expectedMessage) => {
+    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
+      preparePaymentTransaction: async transaction =>
+        mutate(await preparePaymentForTest(transaction)),
+    });
+
+    await expect(client.createPaymentPayload(2, crossCurrencyIouRequirements)).rejects.toThrow(
+      expectedMessage,
+    );
   });
 
   it("creates a ticketSequence payment when the requirements pin the method", async () => {
@@ -1097,10 +1182,10 @@ describe("ExactXrplScheme facilitator verify", () => {
     });
   });
 
-  it("accepts negotiated SourceTag and canonical facilitator proof with InvoiceID", async () => {
+  it("accepts an exact IOU destination with an XRP source cap", async () => {
     const result = await facilitator.verify(
-      buildPayload(attributionXrpRequirements),
-      attributionXrpRequirements,
+      buildPayload(crossCurrencyIouRequirements, { SendMax: "25000000" }),
+      crossCurrencyIouRequirements,
     );
 
     expect(result).toMatchObject({
@@ -1109,152 +1194,97 @@ describe("ExactXrplScheme facilitator verify", () => {
     });
   });
 
-  it("accepts negotiated SourceTag without a facilitator proof Memo", async () => {
-    const requirements = {
-      ...baseXrpRequirements,
-      extra: { ...baseXrpRequirements.extra, sourceTag },
-    };
-
-    const result = await facilitator.verify(buildPayload(requirements), requirements);
+  it("accepts an exact XRP destination with an issued-currency source cap", async () => {
+    const result = await facilitator.verify(
+      buildPayload(crossCurrencyXrpRequirements, {
+        SendMax: { currency: "USD", issuer: sourceIssuer, value: "20" },
+      }),
+      crossCurrencyXrpRequirements,
+    );
 
     expect(result.isValid).toBe(true);
   });
 
-  it("advertises unsponsored fees and facilitator attribution capabilities", () => {
+  it("accepts explicit paths with tfNoRippleDirect", async () => {
+    const result = await facilitator.verify(
+      buildPayload(crossCurrencyIouRequirements, {
+        SendMax: "25000000",
+        Paths: [[{ account: sourceIssuer }]],
+        Flags: TF_NO_RIPPLE_DIRECT,
+      }),
+      crossCurrencyIouRequirements,
+    );
+
+    expect(result.isValid).toBe(true);
+  });
+
+  it("advertises unsponsored fees and cross-currency support", () => {
     expect(facilitator.getExtra(XRPL_TESTNET)).toEqual({
       areFeesSponsored: false,
-      features: { sourceTag: true, facilitatorProof: true },
+      features: {
+        crossCurrency: true,
+        sourceTag: true,
+        facilitatorProof: true,
+      },
     });
   });
 
-  it.each<Array<[string, PaymentRequirements, string]>>([
-    [
-      "malformed SourceTag",
+  it("rejects malformed or mismatched cross-currency envelope negotiation", async () => {
+    const basePayload = buildPayload(baseIouRequirements);
+    const malformedRequirements = {
+      ...baseIouRequirements,
+      extra: { ...baseIouRequirements.extra, crossCurrency: false },
+    };
+    const malformed = await facilitator.verify(
+      { ...basePayload, accepted: malformedRequirements },
+      malformedRequirements,
+    );
+    const mismatched = await facilitator.verify(
       {
-        ...baseXrpRequirements,
-        extra: { ...baseXrpRequirements.extra, sourceTag: "123" },
+        ...basePayload,
+        accepted: {
+          ...basePayload.accepted,
+          extra: { ...basePayload.accepted.extra, crossCurrency: true },
+        },
       },
-      "source_tag_malformed",
+      baseIouRequirements,
+    );
+
+    expect(malformed.invalidReason).toBe("invalid_exact_xrpl_cross_currency_malformed");
+    expect(mismatched.invalidReason).toBe("invalid_exact_xrpl_cross_currency_mismatch");
+  });
+
+  it.each<Array<[string, Partial<Payment>, string]>>([
+    ["missing SendMax", { SendMax: undefined }, "cross_currency_sendmax"],
+    [
+      "same-issue SendMax",
+      { SendMax: { currency: "USD", issuer, value: "20" } },
+      "cross_currency_sendmax",
+    ],
+    ["zero SendMax", { SendMax: "0" }, "cross_currency_sendmax"],
+    [
+      "partial payment",
+      { SendMax: "25000000", Flags: TF_PARTIAL_PAYMENT },
+      "partial_payment_not_allowed",
     ],
     [
-      "malformed facilitator proof",
-      {
-        ...baseXrpRequirements,
-        extra: { ...baseXrpRequirements.extra, sourceTag, facilitatorProof: "not-hex" },
-      },
-      "facilitator_proof_malformed",
+      "DeliverMin",
+      { SendMax: "25000000", DeliverMin: "1", Flags: TF_PARTIAL_PAYMENT },
+      "delivermin_not_allowed",
     ],
     [
-      "facilitator proof without SourceTag",
-      {
-        ...baseXrpRequirements,
-        extra: { ...baseXrpRequirements.extra, facilitatorProof },
-      },
-      "facilitator_proof_requires_source_tag",
+      "tfNoRippleDirect without Paths",
+      { SendMax: "25000000", Flags: TF_NO_RIPPLE_DIRECT },
+      "default_path_disabled_without_paths",
     ],
-  ])("rejects %s in the envelope", async (_caseName, requirements, expectedReason) => {
-    const payload = buildPayload(baseXrpRequirements);
-    const result = await facilitator.verify({ ...payload, accepted: requirements }, requirements);
+  ])("rejects cross-currency payment with %s", async (_name, overrides, expectedReason) => {
+    const result = await facilitator.verify(
+      buildPayload(crossCurrencyIouRequirements, overrides),
+      crossCurrencyIouRequirements,
+    );
 
     expect(result.isValid).toBe(false);
     expect(result.invalidReason).toContain(expectedReason);
-  });
-
-  it("rejects SourceTag present only in the accepted envelope", async () => {
-    const payload = buildPayload(baseXrpRequirements);
-    const result = await facilitator.verify(
-      {
-        ...payload,
-        accepted: {
-          ...payload.accepted,
-          extra: { ...payload.accepted.extra, sourceTag },
-        },
-      },
-      baseXrpRequirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_source_tag_mismatch");
-  });
-
-  it("accepts a payer-signed SourceTag without giving it attribution semantics", async () => {
-    const result = await facilitator.verify(
-      buildPayload(baseXrpRequirements, { SourceTag: sourceTag }),
-      baseXrpRequirements,
-    );
-
-    expect(result.isValid).toBe(true);
-  });
-
-  it("rejects a missing or mismatched negotiated transaction SourceTag", async () => {
-    const missing = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, { SourceTag: undefined }),
-      attributionXrpRequirements,
-    );
-    const mismatched = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, { SourceTag: sourceTag + 1 }),
-      attributionXrpRequirements,
-    );
-
-    expect(missing.invalidReason).toBe("invalid_exact_xrpl_payload_source_tag_mismatch");
-    expect(mismatched.invalidReason).toBe("invalid_exact_xrpl_payload_source_tag_mismatch");
-  });
-
-  it("rejects a missing facilitator attribution Memo", async () => {
-    const result = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, { Memos: undefined }),
-      attributionXrpRequirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_payload_attribution_memo_missing");
-  });
-
-  it("rejects duplicated facilitator attribution Memos", async () => {
-    const [memo] = buildFacilitatorAttributionMemos(sourceTag, facilitatorProof);
-    const result = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, { Memos: [memo, memo] }),
-      attributionXrpRequirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_payload_attribution_memo_cardinality");
-  });
-
-  it("rejects malformed facilitator attribution Memo fields", async () => {
-    const result = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, {
-        Memos: [
-          { Memo: { MemoData: facilitatorAttributionMemoData(sourceTag, facilitatorProof) } },
-        ],
-      }),
-      attributionXrpRequirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_payload_attribution_memo_malformed");
-  });
-
-  it("rejects a facilitator attribution Memo that does not match the proof", async () => {
-    const result = await facilitator.verify(
-      buildPayload(attributionXrpRequirements, {
-        Memos: buildFacilitatorAttributionMemos(sourceTag, "ff".repeat(32)),
-      }),
-      attributionXrpRequirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_payload_attribution_memo_mismatch");
-  });
-
-  it("rejects Memos when only SourceTag was negotiated", async () => {
-    const requirements = {
-      ...baseXrpRequirements,
-      extra: { ...baseXrpRequirements.extra, sourceTag },
-    };
-    const result = await facilitator.verify(
-      buildPayload(requirements, {
-        Memos: buildFacilitatorAttributionMemos(sourceTag, facilitatorProof),
-      }),
-      requirements,
-    );
-
-    expect(result.invalidReason).toBe("invalid_exact_xrpl_payload_memos_not_allowed");
   });
 
   it("returns a stable reason and separate message for malformed payloads", async () => {
@@ -1605,6 +1635,37 @@ describe("ExactXrplScheme facilitator verify", () => {
 
     expect(result.isValid).toBe(false);
     expect(result.invalidReason).toContain("simulation_failed");
+  });
+
+  it("fails cross-currency verification closed when route simulation fails", async () => {
+    const simulator = createFacilitator({
+      simulateSignedTransaction: async () => ({ engineResult: "tecPATH_DRY" }),
+    });
+
+    const result = await simulator.verify(
+      buildPayload(crossCurrencyIouRequirements, { SendMax: "25000000" }),
+      crossCurrencyIouRequirements,
+    );
+
+    expect(result.isValid).toBe(false);
+    expect(result.invalidReason).toContain("simulation_failed: tecPATH_DRY");
+  });
+
+  it("fails cross-currency verification when simulation metadata under-delivers", async () => {
+    const simulator = createFacilitator({
+      simulateSignedTransaction: async () => ({
+        engineResult: "tesSUCCESS",
+        deliveredAmount: { currency: "USD", issuer, value: "10.49" },
+      }),
+    });
+
+    const result = await simulator.verify(
+      buildPayload(crossCurrencyIouRequirements, { SendMax: "25000000" }),
+      crossCurrencyIouRequirements,
+    );
+
+    expect(result.isValid).toBe(false);
+    expect(result.invalidReason).toContain("simulation_delivered_amount_mismatch");
   });
 
   it("rejects a non-Payment transaction", async () => {
@@ -1991,6 +2052,48 @@ describe("ExactXrplScheme facilitator settle", () => {
       payer: payerWallet.classicAddress,
     });
     expect(submitSignedTransaction).toHaveBeenCalledOnce();
+  });
+
+  it("settles cross-currency when delivered_amount is XRPL-precision equivalent", async () => {
+    const settleFacilitator = createFacilitator({
+      submitSignedTransaction: async () => ({
+        hash: settledHash,
+        validated: true,
+        resultCode: "tesSUCCESS",
+        deliveredAmount: { currency: "USD", issuer, value: "10.49999999999999" },
+      }),
+    });
+
+    const result = await settleFacilitator.settle(
+      buildPayload(crossCurrencyIouRequirements, { SendMax: "25000000" }),
+      crossCurrencyIouRequirements,
+    );
+
+    expect(result.success).toBe(true);
+  });
+
+  it.each<Array<[string, Payment["Amount"] | "unavailable" | undefined]>>([
+    ["missing metadata", undefined],
+    ["unavailable metadata", "unavailable"],
+    ["wrong value", { currency: "USD", issuer, value: "10.49" }],
+    ["wrong issue", { currency: "USD", issuer: sourceIssuer, value: "10.5" }],
+  ])("rejects cross-currency settlement with %s", async (_name, deliveredAmount) => {
+    const settleFacilitator = createFacilitator({
+      submitSignedTransaction: async () => ({
+        hash: settledHash,
+        validated: true,
+        resultCode: "tesSUCCESS",
+        deliveredAmount,
+      }),
+    });
+
+    const result = await settleFacilitator.settle(
+      buildPayload(crossCurrencyIouRequirements, { SendMax: "25000000" }),
+      crossCurrencyIouRequirements,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.errorReason).toBe("transaction_failed: delivered_amount_mismatch");
   });
 
   it("does not submit when re-verification fails", async () => {
